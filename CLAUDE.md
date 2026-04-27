@@ -18,14 +18,14 @@ src/sharp_fhir_mcp/
 │   └── types.py               # Literals/enums/typed dicts shared across tools
 ├── clients/
 │   ├── fhir_client.py         # Vendor-neutral async FHIR R4 client
-│   └── omnimem_client.py      # Optional multimodal-memory REST client (OmniSimpleMem)
+│   └── mem0_client.py         # Optional cross-session memory (embedded mem0 SDK)
 ├── tools/
 │   ├── _helpers.py            # Functional helpers shared by tool modules
 │   ├── fhir.py                # Generic FHIR search/read tools
 │   ├── clinical.py            # Patient / Encounter / Appointment / Allergy / …
 │   ├── lab_imaging.py         # Observation / DiagnosticReport / DocumentReference
 │   ├── clinical_context.py    # Aggregated visit context with derived alerts
-│   ├── memory.py              # OmniSimpleMem-backed multimodal memory (optional)
+│   ├── memory.py              # mem0-backed clinical memory (optional, text-only)
 │   └── visualization.py       # MCP-UI Chart.js dashboards
 └── ui/
     ├── clinical_charts.py     # Chart.js HTML builders
@@ -188,47 +188,46 @@ no bundling required. `ClinicalDisplayBuilder` builds the surrounding cards.
 
 ---
 
-## Memory (optional, multimodal)
+## Memory (optional, mem0)
 
-`OmniMemClient.from_env()` returns `None` when `OMNIMEM_API_URL` is unset,
-and `register_memory_tools(mcp, None)` is a no-op. This lets the rest of
-the server run without any memory backend.
+`Mem0Client.from_env()` returns `None` when:
+* `mem0ai` isn't installed (the `[memory]` extra wasn't pulled in),
+* `MEM0_DISABLED=1` is set,
+* `mem0.Memory.from_config(...)` raises (e.g. malformed config).
 
-The client speaks the [OmniSimpleMem](https://github.com/aiming-lab/SimpleMem/tree/main/OmniSimpleMem)
-REST API:
+Any of those leaves `register_memory_tools(mcp, None)` as a no-op, so the
+rest of the server runs without a memory backend.
 
-| Endpoint                   | Used by                                 |
-| -------------------------- | --------------------------------------- |
-| `POST /memory/text`        | `memory_store_encounter/alert/note`     |
-| `POST /memory/image`       | `memory_store_image`                    |
-| `POST /memory/audio`       | `memory_store_audio`                    |
-| `POST /memory/video`       | `memory_store_video`                    |
-| `POST /query`              | `memory_search_history`, `memory_get_patient_history` |
-| `POST /answer`             | `memory_answer_question` (RAG)          |
-| `POST /expand`             | `memory_expand` (preview → evidence)    |
-| `GET  /stats`              | `memory_stats`                          |
+The client is a **thin async wrapper around the sync mem0 SDK** — every
+call is `asyncio.to_thread`'d so it composes with FastMCP's async tools.
 
-Every stored item is tagged with `patient_id:<FHIR id>` plus a `type:` tag
-(`encounter` / `alert` / `note` / `image` / `audio` / `video`). Search calls
-re-inject the patient tag into the query string so OmniSimpleMem's BM25
-sparse retriever scopes results to one patient.
+| mem0 SDK method      | Memory tool                                             |
+| -------------------- | ------------------------------------------------------- |
+| `memory.add()`       | `memory_store_encounter`, `memory_store_alert`, `memory_store_note` |
+| `memory.search()`    | `memory_search_history`                                 |
+| `memory.get_all()`   | `memory_get_patient_history`                            |
+| `memory.delete()`    | `memory_delete`                                         |
+| `memory.delete_all()`| `memory_reset_patient`                                  |
 
-**Multimodal ingestion path:** the agent host writes a media file into the
-shared volume (`./shared` on the host → `/shared` in both containers), then
-calls `memory_store_image` (or `_audio`/`_video`) with that path. The
-OmniMem client streams the file as multipart form data; OmniSimpleMem then
-runs CLIP scene-change detection (visual) or VAD silence-filtering (audio)
-to drop redundant content before storage.
+**Scoping.** Each FHIR Patient maps to a unique mem0 `user_id`:
+`patient:<FHIR id>`. All store/search/list calls pass that `user_id`, so
+mem0's own indices isolate memory per patient. `agent_id` is fixed to
+`sharp-fhir-mcp` for cross-deployment provenance.
 
-**Embeddings:** OmniSimpleMem defaults to local sentence-transformers
-(`all-MiniLM-L6-v2`, 384-dim). LLM steps (summary / answer / caption) use
-an OpenAI-compatible endpoint — set `OPENAI_API_BASE` to point at OpenRouter,
-Ollama OpenAI-mode, vLLM, LM Studio, etc.
+**LLM-driven extraction.** mem0 doesn't store input text verbatim — it
+runs an LLM pass (`MEM0_LLM_MODEL`) to extract atomic facts and stores
+those. This is why `OPENAI_API_KEY` (or `OPENAI_API_BASE` for compat) is
+required for memory tools to work.
 
-**Upstream caveat:** OmniSimpleMem's `omni_memory/core/config.py` was missing
-on `main` at the time of writing. `docker/omnimem/Dockerfile` checks for the
-file and copies in `docker/omnimem/config_shim.py` if absent. Remove the
-shim once upstream ships the real config module.
+**Vector store.** Defaults to embedded Chroma at `/data/mem0/chroma`.
+Switchable via `MEM0_VECTOR_STORE=qdrant|pgvector`.
+
+**Why not multimodal?** mem0 is text-only by design. For radiology images
+/ audio dictation / video clips the agent host should run captioning,
+transcription, or summary (VLM, Whisper, video summariser) and persist
+the resulting text via `memory_store_note(note_type="radiology"|"transcript"|...)`.
+That keeps mem0's index clean and lets the host pick the right model
+per modality.
 
 ---
 

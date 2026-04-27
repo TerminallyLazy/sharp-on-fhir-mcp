@@ -16,12 +16,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 COPY pyproject.toml README.md ./
 COPY src ./src
 
-RUN pip install -e .
+# Install the package + the optional `memory` group (mem0ai). Skipping the
+# group is fine; the memory_* tools are simply not registered when mem0 is
+# unavailable.
+RUN pip install -e ".[memory]"
 
 ENV HOST=0.0.0.0 \
     PORT=8000 \
-    LOG_LEVEL=INFO
+    LOG_LEVEL=INFO \
+    MEM0_DATA_DIR=/data/mem0
 
+VOLUME ["/data"]
 EXPOSE 8000
 
 # fastmcp 2.x CLI auto-discovers `mcp` in src/sharp_fhir_mcp/server.py.

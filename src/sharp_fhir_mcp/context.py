@@ -91,6 +91,30 @@ def _normalise_headers(raw: dict[str, str] | None) -> dict[str, str]:
     return {k.lower(): v for k, v in raw.items()}
 
 
+def _patient_id_from_jwt(token: str | None) -> str | None:
+    """Extract the ``patient`` claim from a SMART access token, if present.
+
+    Per the Prompt Opinion Platform reference impl
+    (`prompt-opinion/po-community-mcp`), the SMART access token forwarded
+    in ``X-FHIR-Access-Token`` may carry a ``patient`` claim that supersedes
+    any explicit ``X-Patient-ID`` header. We don't validate the signature
+    — that's the agent host's job. We only need the claim payload.
+    """
+    if not token:
+        return None
+    try:
+        # Lazy import — pyjwt is pulled in transitively by fastmcp's auth deps.
+        import jwt  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    try:
+        claims = jwt.decode(token, options={"verify_signature": False})
+    except Exception:  # noqa: BLE001 — malformed/empty token, skip silently
+        return None
+    patient = claims.get("patient")
+    return str(patient) if patient else None
+
+
 def _build_context_from_headers(headers: dict[str, str]) -> SharpContext:
     server_url = headers.get(HEADER_FHIR_SERVER_URL.lower()) or os.getenv(
         ENV_FHIR_SERVER_URL
@@ -98,10 +122,19 @@ def _build_context_from_headers(headers: dict[str, str]) -> SharpContext:
     access_token = headers.get(HEADER_FHIR_ACCESS_TOKEN.lower()) or os.getenv(
         ENV_FHIR_ACCESS_TOKEN
     )
-    patient_id = headers.get(HEADER_PATIENT_ID.lower()) or os.getenv(ENV_PATIENT_ID)
 
     if access_token and access_token.lower().startswith("bearer "):
         access_token = access_token[7:].strip()
+
+    # Patient id resolution order (matches Prompt Opinion's reference impl):
+    #   1. JWT `patient` claim from the access token (if it's a SMART token).
+    #   2. Explicit ``X-Patient-ID`` header.
+    #   3. ``PATIENT_ID`` env-var fallback (dev only).
+    patient_id = (
+        _patient_id_from_jwt(access_token)
+        or headers.get(HEADER_PATIENT_ID.lower())
+        or os.getenv(ENV_PATIENT_ID)
+    )
 
     return SharpContext(
         server_url=server_url.rstrip("/") if server_url else None,

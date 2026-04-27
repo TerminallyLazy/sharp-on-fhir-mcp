@@ -50,33 +50,30 @@ headers automatically.
 * `lab_get_results`, `lab_get_vital_signs`, `lab_get_diagnostic_reports`
 * `imaging_get_documents` — DocumentReference search
 
-### 🧠 Optional persistent multimodal memory (OmniSimpleMem)
+### 🧠 Optional persistent clinical memory (mem0)
 
-Backed by [OmniSimpleMem](https://github.com/aiming-lab/SimpleMem/tree/main/OmniSimpleMem)
-— hybrid (FAISS + BM25) retrieval, pyramid expansion (preview → details →
-evidence), cross-modal knowledge graph, and four-modality ingestion. The
-shipped `docker-compose.yml` runs the OmniSimpleMem REST server alongside
-this server.
+Backed by [mem0](https://github.com/mem0ai/mem0) (Apache-2.0). mem0 is
+embedded as a Python library — no separate service or database. Memory
+state persists in a Docker volume (`mem0_data`).
 
-Available when `OMNIMEM_API_URL` is set (defaults to `http://omnimem:8000`
-under docker-compose):
+mem0 is text-only at the storage layer, but is well-suited to clinical
+narrative use (encounters, alerts, notes, transcripts). For non-text
+inputs (radiology films, audio dictation, video clips), the agent host
+should pre-process — caption images via a VLM, transcribe audio with
+Whisper, summarise video — and persist the resulting *text* via
+`memory_store_note`. This keeps memory cleanly searchable and lets each
+host pick the right model per modality.
 
-**Text**
+Available when `OPENAI_API_KEY` (or `OPENAI_API_BASE` for an OpenAI-compat
+provider) is set, and `MEM0_DISABLED` is not `1`:
+
 * `memory_store_encounter` — visit summary with diagnoses, plan, complaint
 * `memory_store_alert` — persistent clinical flag (allergy, drug interaction, …)
-* `memory_store_note` — free-text note
-
-**Multimodal**
-* `memory_store_image` — radiology film, dermatology photo, ECG strip image
-* `memory_store_audio` — consult recording, dictation, heart sound
-* `memory_store_video` — procedure video, ultrasound clip, gait recording
-
-**Retrieval**
-* `memory_search_history` — hybrid retrieval scoped to current patient
-* `memory_get_patient_history` — recent memories for the patient
-* `memory_answer_question` — RAG answer grounded in patient memory
-* `memory_expand` — expand specific MAUs to evidence level
-* `memory_stats` — system statistics
+* `memory_store_note` — free-text note (use for VLM/Whisper outputs)
+* `memory_search_history` — semantic search scoped to current patient
+* `memory_get_patient_history` — list memories for the patient
+* `memory_delete` — remove a single memory by id
+* `memory_reset_patient` — wipe all memories for one patient (irreversible)
 
 ### 📊 MCP-UI visualisations
 
@@ -106,14 +103,26 @@ sharp-fhir-mcp --port 9000         # custom port
 SHARP_STRICT_CONTEXT=1 sharp-fhir-mcp   # reject calls missing FHIR headers
 ```
 
-The MCP endpoint is `http://localhost:8000/mcp/`.
+The MCP endpoint is `http://localhost:8000/mcp`.
 
-For the full stack (FHIR MCP + OmniSimpleMem multimodal memory):
+For the full stack (FHIR MCP server + embedded mem0 memory) use the
+one-shot bring-up script — it handles the broken-`docker`-symlink case
+(common after migrating off OrbStack), seeds `.env` if missing, optionally
+prunes build cache, and starts the stack detached:
+
+```bash
+./scripts/start.sh                   # build + start, detached
+./scripts/start.sh --no-memory       # disable mem0 (memory_* tools omitted)
+./scripts/start.sh --logs            # follow logs after start
+./scripts/start.sh --prune --build   # free disk + rebuild from scratch
+./scripts/start.sh --down            # tear down + remove memory volume
+```
+
+Or run compose directly:
 
 ```bash
 cp .env.example .env                 # set OPENAI_API_KEY (or OPENAI_API_BASE)
-docker compose up --build            # both services
-docker compose --profile no-memory up    # FHIR-only, no memory backend
+docker compose up --build -d
 ```
 
 > **Note:** `localhost` here refers to localhost of the machine where you are
@@ -186,45 +195,36 @@ sharp-fhir-mcp                   # http://localhost:8000/mcp
 
 ### Docker / docker-compose
 
-A two-service stack ships in this repo:
-
-| Service          | Image / build                                | Purpose |
-| ---------------- | -------------------------------------------- | ------- |
-| `sharp-fhir-mcp` | `Dockerfile` (repo root)                     | The FHIR MCP server (this repo) |
-| `omnimem`        | `docker/omnimem/Dockerfile`                  | OmniSimpleMem REST backend      |
+A single-service stack: the FHIR MCP server runs in one container and
+embeds mem0 as a library.
 
 ```bash
 cp .env.example .env
-# At a minimum set OPENAI_API_KEY (or OPENAI_API_BASE for an OpenAI-compat
-# provider — OpenRouter, Ollama OpenAI-mode, vLLM, LM Studio, Together).
+# Set OPENAI_API_KEY (or OPENAI_API_BASE for an OpenAI-compat provider:
+# OpenRouter, Ollama OpenAI-mode, vLLM, LM Studio, Together).
 docker compose up --build
 ```
 
-* MCP endpoint: `http://localhost:8000/mcp/`
-* OmniSimpleMem REST docs (debug): `http://localhost:8001/docs`
-* Persistent memory volume: `omnimem_data`
-* Shared media dir for ingestion: `./shared` → `/shared` in both containers
+* MCP endpoint: `http://localhost:8000/mcp`
+* Persistent memory volume: `mem0_data` (mounted at `/data` in container)
 
-#### Local embeddings (no OpenAI for vectors)
+#### Local LLM + embeddings (no OpenAI calls)
 
-The default `EMBEDDING_MODEL_NAME=all-MiniLM-L6-v2` runs locally via
-`sentence-transformers` (no API call). Override with any HuggingFace model
-plus matching `EMBEDDING_DIM`:
+Point both the LLM and embedder at a local Ollama:
 
 ```bash
-EMBEDDING_MODEL_NAME=BAAI/bge-base-en-v1.5
-EMBEDDING_DIM=768
+OPENAI_API_BASE=http://host.docker.internal:11434/v1
+MEM0_LLM_PROVIDER=ollama
+MEM0_LLM_MODEL=llama3.1
+MEM0_EMBED_PROVIDER=ollama
+MEM0_EMBED_MODEL=nomic-embed-text
 ```
 
-LLM operations (summary / answer / caption) still need an OpenAI-compat
-endpoint — point `OPENAI_API_BASE` at Ollama (`http://host.docker.internal:11434/v1`)
-to keep everything local.
+#### Disabling memory
 
-> ⚠️ **Upstream caveat:** OmniSimpleMem's `omni_memory/core/config.py` was
-> not committed to the public repo at the time of writing. The
-> `docker/omnimem/Dockerfile` vendors a faithful shim
-> (`docker/omnimem/config_shim.py`) when upstream is missing the file —
-> remove the shim once the upstream package is complete.
+Pass `MEM0_DISABLED=1` (or `./scripts/start.sh --no-memory`) to skip mem0
+entirely. The FHIR/clinical/lab/visualisation tools still work; only the
+`memory_*` tools are omitted.
 
 ---
 
@@ -253,7 +253,7 @@ to keep everything local.
 │  │ ├─ fhir_*           (generic R4 search/read)           │ │
 │  │ ├─ clinical_*       (patient/encounter/medication/…)   │ │
 │  │ ├─ lab_* / imaging_*(observations, reports, docs)      │ │
-│  │ ├─ memory_*         (optional OmniSimpleMem multimodal)│ │
+│  │ ├─ memory_*         (optional, embedded mem0)         │ │
 │  │ └─ visualize_*      (MCP-UI Chart.js dashboards)       │ │
 │  └─────────────────────────┬──────────────────────────────┘ │
 │                            ▼                                │

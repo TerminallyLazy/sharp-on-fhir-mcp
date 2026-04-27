@@ -1,17 +1,28 @@
-"""Optional clinical memory tools backed by OmniSimpleMem.
+"""Optional clinical memory tools backed by mem0.
 
-Tools registered only when ``OMNIMEM_API_URL`` is set. Provide persistent,
-cross-session, multimodal memory of past encounters, alerts, notes, and
-clinical media (images / audio / video) keyed to FHIR Patient ids.
+Tools registered only when mem0 is installed and configured (set
+``OPENAI_API_KEY`` or ``OPENAI_API_BASE`` for an OpenAI-compatible
+provider — see ``clients/mem0_client.py``).
 
-OmniSimpleMem features used:
-    * Hybrid (FAISS dense + BM25 sparse) retrieval, scoped via patient tags.
-    * Pyramid retrieval (preview → details → evidence) for token efficiency.
-    * Multimodal ingestion of medical images, audio recordings, and video.
-    * Optional RAG-style ``memory_answer_question`` over the patient's memory.
+mem0 is text-only: it ingests conversation messages and runs an LLM-driven
+extraction pass to store atomic facts. We expose a clinically-shaped tool
+surface on top:
 
-NOTE: Identifiers are FHIR resource ids (strings), per the SHARP context
-model.
+    * memory_store_encounter   — visit summary
+    * memory_store_alert       — persistent flag
+    * memory_store_note        — free-text note
+    * memory_search_history    — semantic search scoped to a patient
+    * memory_get_patient_history — list all memories for the patient
+    * memory_delete            — remove one memory
+    * memory_reset_patient     — wipe all memories for the patient
+
+For non-text clinical data (radiology images, audio dictation, video
+clips), the agent host should pre-process them — caption images via a VLM,
+transcribe audio with Whisper, summarise video — and then store the
+resulting *text* through ``memory_store_note``. That keeps mem0's surface
+clean and lets the host pick the right model per modality.
+
+NOTE: Identifiers are FHIR resource ids (strings).
 """
 
 from __future__ import annotations
@@ -21,7 +32,7 @@ from typing import Any
 from fastmcp import FastMCP
 
 from sharp_fhir_mcp.clients.fhir_client import FHIRError
-from sharp_fhir_mcp.clients.omnimem_client import OmniMemClient, OmniMemError
+from sharp_fhir_mcp.clients.mem0_client import Mem0Client, Mem0Error
 from sharp_fhir_mcp.context import fhir_client_for_current_context
 from sharp_fhir_mcp.fhir_utils import patient_display_name
 from sharp_fhir_mcp.tools._helpers import check_fhir_context, resolve_patient_id
@@ -29,12 +40,11 @@ from sharp_fhir_mcp.tools._helpers import check_fhir_context, resolve_patient_id
 
 def register_memory_tools(
     mcp: FastMCP,
-    memory_client: OmniMemClient | None,
+    memory_client: Mem0Client | None,
 ) -> None:
     """Register clinical-memory tools.
 
-    No-op when ``memory_client`` is ``None``. Callers should still invoke
-    this so registration is consistent across configurations.
+    No-op when ``memory_client`` is ``None``.
     """
     if memory_client is None or not memory_client.is_configured:
         return
@@ -45,10 +55,6 @@ def register_memory_tools(
                 return patient_display_name(await fhir.get_patient(pid))
         except FHIRError:
             return ""
-
-    # --
-    # Text memories — encounters, alerts, free-text notes
-    # --
 
     @mcp.tool
     async def memory_store_encounter(
@@ -75,21 +81,32 @@ def register_memory_tools(
             return err
         pid = resolve_patient_id(patient_id) or ""
         name = await _patient_name(pid) or pid
-        diagnosis_list = [d.strip() for d in diagnosis.split(",")] if diagnosis else None
+
+        parts = [
+            f"Encounter for {name} (FHIR Patient/{pid}) on {visit_date}.",
+        ]
+        if practitioner_name:
+            parts.append(f"Provider: {practitioner_name}.")
+        if chief_complaint:
+            parts.append(f"Chief complaint: {chief_complaint}.")
+        if diagnosis:
+            parts.append(f"Diagnosis: {diagnosis}.")
+        if plan:
+            parts.append(f"Plan: {plan}.")
+        parts.append(f"Summary: {encounter_summary}")
 
         try:
-            result = await memory_client.store_patient_encounter(
+            result = await memory_client.add_text(
+                "\n".join(parts),
                 patient_id=pid,
-                patient_name=name,
-                encounter_summary=encounter_summary,
-                visit_date=visit_date,
-                practitioner_name=practitioner_name,
-                chief_complaint=chief_complaint,
-                diagnosis=diagnosis_list,
-                plan=plan,
+                metadata={
+                    "type": "encounter",
+                    "visit_date": visit_date,
+                    "patient_name": name,
+                },
             )
-        except OmniMemError as e:
-            return {"success": False, "error": str(e), "detail": e.detail}
+        except Mem0Error as e:
+            return {"success": False, "error": str(e)}
 
         return {
             "success": True,
@@ -122,16 +139,23 @@ def register_memory_tools(
             severity = "warning"
         name = await _patient_name(pid) or pid
 
+        text = (
+            f"CLINICAL ALERT [{severity.upper()}] for {name} "
+            f"(FHIR Patient/{pid}). Type: {alert_type}. {alert_content}"
+        )
         try:
-            result = await memory_client.store_clinical_alert(
+            result = await memory_client.add_text(
+                text,
                 patient_id=pid,
-                patient_name=name,
-                alert_type=alert_type,
-                alert_content=alert_content,
-                severity=severity,
+                metadata={
+                    "type": "alert",
+                    "alert_type": alert_type,
+                    "severity": severity,
+                    "patient_name": name,
+                },
             )
-        except OmniMemError as e:
-            return {"success": False, "error": str(e), "detail": e.detail}
+        except Mem0Error as e:
+            return {"success": False, "error": str(e)}
 
         return {
             "success": True,
@@ -144,285 +168,118 @@ def register_memory_tools(
     @mcp.tool
     async def memory_store_note(
         note: str,
-        tags: str | None = None,
+        note_type: str = "general",
         patient_id: str | None = None,
     ) -> dict:
         """Store a free-text clinical note tagged to the patient.
 
+        Use this for any text the agent has produced from non-text inputs:
+        radiology read summaries, audio-dictation transcripts, video-clip
+        descriptions, etc. The agent host is responsible for the
+        VLM/Whisper/etc pre-processing — this tool only persists text.
+
         Args:
             note: Note content.
-            tags: Optional comma-separated extra tags.
+            note_type: Free-form sub-type tag (``radiology``, ``transcript``,
+                ``video_summary``, ``general``, …).
             patient_id: FHIR Patient id.
         """
         if (err := check_fhir_context(require_patient=True, patient_id=patient_id)) is not None:
             return err
         pid = resolve_patient_id(patient_id) or ""
-        extra = [t.strip() for t in tags.split(",")] if tags else None
-
         try:
             result = await memory_client.add_text(
-                f"Note (FHIR Patient/{pid}): {note}",
-                session_id=pid,
-                tags=[f"patient_id:{pid}", "type:note", *(extra or [])],
+                f"Note ({note_type}) for FHIR Patient/{pid}: {note}",
+                patient_id=pid,
+                metadata={"type": "note", "note_type": note_type},
             )
-        except OmniMemError as e:
-            return {"success": False, "error": str(e), "detail": e.detail}
-
-        return {"success": True, "patient_id": pid, "result": result}
-
-    # --
-    # Multimodal memories
-    # --
-
-    @mcp.tool
-    async def memory_store_image(
-        image_path: str,
-        description: str | None = None,
-        patient_id: str | None = None,
-    ) -> dict:
-        """Ingest a clinical image (radiology film, dermatology photo, etc.) into memory.
-
-        ``image_path`` must be readable by THIS server process — useful when
-        the agent host has uploaded a file to a shared volume. Images are
-        filtered by CLIP scene-change detection (~70% storage reduction).
-
-        Args:
-            image_path: Path to image file (PNG/JPG/etc).
-            description: Optional caption / radiology read.
-            patient_id: FHIR Patient id.
-        """
-        if (err := check_fhir_context(require_patient=True, patient_id=patient_id)) is not None:
-            return err
-        pid = resolve_patient_id(patient_id) or ""
-        tags = [f"patient_id:{pid}", "type:image"]
-
-        try:
-            result = await memory_client.add_image(
-                image_path, session_id=pid, tags=tags
-            )
-            if description:
-                # Pair the image MAU with a text caption for retrieval coverage.
-                await memory_client.add_text(
-                    f"Image caption (FHIR Patient/{pid}, file={image_path}): "
-                    f"{description}",
-                    session_id=pid,
-                    tags=[*tags, "type:image_caption"],
-                )
-        except (OmniMemError, FileNotFoundError) as e:
+        except Mem0Error as e:
             return {"success": False, "error": str(e)}
-
         return {"success": True, "patient_id": pid, "result": result}
-
-    @mcp.tool
-    async def memory_store_audio(
-        audio_path: str,
-        description: str | None = None,
-        patient_id: str | None = None,
-    ) -> dict:
-        """Ingest a clinical audio recording (consult, dictation, heart sound).
-
-        Audio passes through VAD silence-filtering (~40% reduction). Pair
-        with a transcript via ``description`` for richer retrieval.
-
-        Args:
-            audio_path: Path to audio file (WAV/MP3/etc).
-            description: Optional caption / transcript snippet.
-            patient_id: FHIR Patient id.
-        """
-        if (err := check_fhir_context(require_patient=True, patient_id=patient_id)) is not None:
-            return err
-        pid = resolve_patient_id(patient_id) or ""
-        tags = [f"patient_id:{pid}", "type:audio"]
-
-        try:
-            result = await memory_client.add_audio(
-                audio_path, session_id=pid, tags=tags
-            )
-            if description:
-                await memory_client.add_text(
-                    f"Audio caption (FHIR Patient/{pid}, file={audio_path}): "
-                    f"{description}",
-                    session_id=pid,
-                    tags=[*tags, "type:audio_caption"],
-                )
-        except (OmniMemError, FileNotFoundError) as e:
-            return {"success": False, "error": str(e)}
-
-        return {"success": True, "patient_id": pid, "result": result}
-
-    @mcp.tool
-    async def memory_store_video(
-        video_path: str,
-        description: str | None = None,
-        max_frames: int = 100,
-        patient_id: str | None = None,
-    ) -> dict:
-        """Ingest a clinical video (procedure recording, ultrasound clip, gait).
-
-        OmniSimpleMem extracts up to ``max_frames`` keyframes via CLIP-based
-        scene-change detection.
-
-        Args:
-            video_path: Path to video file (MP4/MOV/etc).
-            description: Optional caption / procedure note.
-            max_frames: Cap on extracted frames (default 100).
-            patient_id: FHIR Patient id.
-        """
-        if (err := check_fhir_context(require_patient=True, patient_id=patient_id)) is not None:
-            return err
-        pid = resolve_patient_id(patient_id) or ""
-        tags = [f"patient_id:{pid}", "type:video"]
-
-        try:
-            result = await memory_client.add_video(
-                video_path, session_id=pid, tags=tags, max_frames=max_frames
-            )
-            if description:
-                await memory_client.add_text(
-                    f"Video caption (FHIR Patient/{pid}, file={video_path}): "
-                    f"{description}",
-                    session_id=pid,
-                    tags=[*tags, "type:video_caption"],
-                )
-        except (OmniMemError, FileNotFoundError) as e:
-            return {"success": False, "error": str(e)}
-
-        return {"success": True, "patient_id": pid, "result": result}
-
-    # --
-    # Retrieval
-    # --
 
     @mcp.tool
     async def memory_search_history(
         query: str,
-        top_k: int = 10,
-        auto_expand: bool = True,
+        limit: int = 10,
         patient_id: str | None = None,
     ) -> dict:
-        """Search the patient's clinical memory with hybrid retrieval.
+        """Semantic search across the patient's clinical memory.
 
         Args:
             query: Natural-language search.
-            top_k: Max results (1–50).
-            auto_expand: Expand top hits to evidence level (slower, more detail).
+            limit: Max results (1–50).
             patient_id: FHIR Patient id.
         """
         if (err := check_fhir_context(require_patient=True, patient_id=patient_id)) is not None:
             return err
         pid = resolve_patient_id(patient_id) or ""
-        top_k = min(max(top_k, 1), 50)
-        scoped = f"patient_id:{pid} {query}".strip()
-
         try:
-            result = await memory_client.query(
-                scoped, top_k=top_k, auto_expand=auto_expand
+            result = await memory_client.search(
+                query, patient_id=pid, limit=min(max(limit, 1), 50)
             )
-        except OmniMemError as e:
-            return {"success": False, "error": str(e), "detail": e.detail}
-
+        except Mem0Error as e:
+            return {"success": False, "error": str(e)}
         return {"patient_id": pid, "query": query, "results": result}
 
     @mcp.tool
     async def memory_get_patient_history(
         patient_id: str | None = None,
-        top_k: int = 20,
+        limit: int = 50,
     ) -> dict:
-        """Return recent stored memories for the current patient.
+        """Return all stored memories for the patient.
 
         Args:
             patient_id: FHIR Patient id.
-            top_k: Max memories (1–100).
+            limit: Max memories (1–200).
         """
         if (err := check_fhir_context(require_patient=True, patient_id=patient_id)) is not None:
             return err
         pid = resolve_patient_id(patient_id) or ""
-        top_k = min(max(top_k, 1), 100)
-
         try:
-            result = await memory_client.get_patient_history(
-                patient_id=pid, top_k=top_k
+            result = await memory_client.get_all(
+                patient_id=pid, limit=min(max(limit, 1), 200)
             )
-        except OmniMemError as e:
-            return {"success": False, "error": str(e), "detail": e.detail}
-
+        except Mem0Error as e:
+            return {"success": False, "error": str(e)}
         return {"patient_id": pid, "memories": result}
 
     @mcp.tool
-    async def memory_answer_question(
-        question: str,
-        top_k: int = 10,
-        include_sources: bool = True,
-        patient_id: str | None = None,
-    ) -> dict:
-        """Answer a question grounded in the patient's clinical memory (RAG).
-
-        Uses OmniSimpleMem's ``/answer`` endpoint, which retrieves relevant
-        MAUs and asks the configured LLM to synthesise an answer.
+    async def memory_delete(memory_id: str) -> dict:
+        """Delete a single memory by id.
 
         Args:
-            question: Natural-language question.
-            top_k: Memories to retrieve as context.
-            include_sources: Return source MAUs alongside the answer.
-            patient_id: FHIR Patient id (scopes retrieval).
+            memory_id: The mem0 memory id (returned by store/search calls).
+        """
+        try:
+            result = await memory_client.delete(memory_id)
+        except Mem0Error as e:
+            return {"success": False, "error": str(e)}
+        return {"success": True, "memory_id": memory_id, "result": result}
+
+    @mcp.tool
+    async def memory_reset_patient(patient_id: str | None = None) -> dict:
+        """Wipe all stored memories for one patient. Irreversible.
+
+        Args:
+            patient_id: FHIR Patient id.
         """
         if (err := check_fhir_context(require_patient=True, patient_id=patient_id)) is not None:
             return err
         pid = resolve_patient_id(patient_id) or ""
-        scoped = f"For FHIR Patient/{pid}: {question}"
-
         try:
-            result = await memory_client.answer(
-                scoped, top_k=top_k, include_sources=include_sources
-            )
-        except OmniMemError as e:
-            return {"success": False, "error": str(e), "detail": e.detail}
-
-        return {"patient_id": pid, "question": question, "answer": result}
-
-    @mcp.tool
-    async def memory_expand(
-        mau_ids: str,
-        level: str = "evidence",
-    ) -> dict:
-        """Expand specific Multimodal Atomic Units (MAUs) to full content.
-
-        Use after ``memory_search_history`` returns previews — pass the
-        ``mau_id``s you want full evidence for.
-
-        Args:
-            mau_ids: Comma-separated MAU ids.
-            level: ``summary`` | ``metadata`` | ``details`` | ``evidence``.
-        """
-        ids = [m.strip() for m in mau_ids.split(",") if m.strip()]
-        if not ids:
-            return {"success": False, "error": "no mau_ids provided"}
-        try:
-            result = await memory_client.expand(ids, level=level)
-        except OmniMemError as e:
-            return {"success": False, "error": str(e), "detail": e.detail}
-        return {"mau_ids": ids, "level": level, "result": result}
-
-    @mcp.tool
-    async def memory_stats() -> dict:
-        """Return OmniSimpleMem system statistics (MAU/event/vector counts)."""
-        try:
-            return await memory_client.stats()
-        except OmniMemError as e:
-            return {"success": False, "error": str(e), "detail": e.detail}
+            result = await memory_client.delete_all(patient_id=pid)
+        except Mem0Error as e:
+            return {"success": False, "error": str(e)}
+        return {"success": True, "patient_id": pid, "result": result}
 
     _: Any = (
         memory_store_encounter,
         memory_store_alert,
         memory_store_note,
-        memory_store_image,
-        memory_store_audio,
-        memory_store_video,
         memory_search_history,
         memory_get_patient_history,
-        memory_answer_question,
-        memory_expand,
-        memory_stats,
+        memory_delete,
+        memory_reset_patient,
     )
 
 

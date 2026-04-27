@@ -1,55 +1,19 @@
 # Local-dev / self-hosted stack for sharp-fhir-mcp.
 #
-# Two services:
-#   omnimem        — multimodal lifelong-memory backend (OmniSimpleMem REST).
-#                    Persists under the `omnimem_data` volume.
-#   sharp-fhir-mcp — the SHARP-on-MCP FHIR server, talks to omnimem over the
-#                    internal Docker network and exposes Streamable HTTP MCP
-#                    on host port 8000.
+# A single-service stack: the FHIR MCP server runs in one container and
+# embeds mem0 (Apache-2.0) as a Python library — there's no separate memory
+# service, no Postgres, no dashboard. Memory state persists in a named
+# Docker volume (`mem0_data`) so it survives container rebuilds.
 #
 # Quickstart:
 #   cp .env.example .env
-#   # edit .env — set OPENAI_API_KEY (or OPENAI_API_BASE for a compat provider)
+#   # set OPENAI_API_KEY (or OPENAI_API_BASE for an OpenAI-compat provider)
 #   docker compose up --build
 #
-# Use `docker compose --profile no-memory up` to run only the FHIR MCP server
-# (no omnimem dependency — memory_* tools are auto-disabled).
+# To run with no memory backend (just the FHIR MCP tools), set
+# `MEM0_DISABLED=1` in `.env` — the memory_* tools will simply be omitted.
 
 services:
-  omnimem:
-    container_name: sharp-omnimem
-    build:
-      context: ./docker/omnimem
-      dockerfile: Dockerfile
-    environment:
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_API_BASE: ${OPENAI_API_BASE:-}
-      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
-      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-all-MiniLM-L6-v2}
-      EMBEDDING_DIM: ${EMBEDDING_DIM:-384}
-      OMNI_MEMORY_DATA_DIR: /data
-      DEBUG_MODE: ${DEBUG_MODE:-0}
-    volumes:
-      - omnimem_data:/data
-      # Mount a host dir if you want the FHIR MCP server to upload media
-      # files into omnimem (image/audio/video). The path inside both
-      # containers is `/shared` — pass that path to memory_store_image etc.
-      - ${SHARED_MEDIA_DIR:-./shared}:/shared
-    # OmniMem only listens on the internal docker network by default. Expose
-    # 8000 on the host if you want to inspect /docs directly.
-    ports:
-      - "${OMNIMEM_HOST_PORT:-8001}:8000"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 60s
-    profiles: ["", "default", "full"]
-
   sharp-fhir-mcp:
     container_name: sharp-fhir-mcp
     build:
@@ -60,33 +24,27 @@ services:
       PORT: 8000
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       SHARP_STRICT_CONTEXT: ${SHARP_STRICT_CONTEXT:-0}
-      OMNIMEM_API_URL: ${OMNIMEM_API_URL:-http://omnimem:8000}
-      OMNIMEM_API_TOKEN: ${OMNIMEM_API_TOKEN:-}
       # Local-dev FHIR fallback (only used when no SHARP headers supplied).
       FHIR_SERVER_URL: ${FHIR_SERVER_URL:-}
       FHIR_ACCESS_TOKEN: ${FHIR_ACCESS_TOKEN:-}
       PATIENT_ID: ${PATIENT_ID:-}
+      # mem0 (clinical memory). Required for memory_* tools.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-}
+      MEM0_DISABLED: ${MEM0_DISABLED:-0}
+      MEM0_LLM_PROVIDER: ${MEM0_LLM_PROVIDER:-openai}
+      MEM0_LLM_MODEL: ${MEM0_LLM_MODEL:-gpt-4o-mini}
+      MEM0_EMBED_PROVIDER: ${MEM0_EMBED_PROVIDER:-openai}
+      MEM0_EMBED_MODEL: ${MEM0_EMBED_MODEL:-text-embedding-3-small}
+      MEM0_VECTOR_STORE: ${MEM0_VECTOR_STORE:-chroma}
+      MEM0_DATA_DIR: /data/mem0
     ports:
       - "${SHARP_HOST_PORT:-8000}:8000"
     volumes:
-      - ${SHARED_MEDIA_DIR:-./shared}:/shared
-    depends_on:
-      omnimem:
-        condition: service_healthy
+      - mem0_data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
-    profiles: ["", "default", "full"]
-
-  # Single-service variant for users who don't want omnimem.
-  sharp-fhir-mcp-only:
-    extends:
-      service: sharp-fhir-mcp
-    container_name: sharp-fhir-mcp-only
-    depends_on: []
-    environment:
-      HOST: 0.0.0.0
-      PORT: 8000
-      OMNIMEM_API_URL: ""
-    profiles: ["no-memory"]
 
 volumes:
-  omnimem_data:
+  mem0_data:

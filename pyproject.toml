@@ -35,9 +35,22 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "starlette>=0.40.0",
     "uvicorn>=0.30.0",
+    # SMART access tokens carry a `patient` claim — we decode (no
+    # signature verification; the agent host validates) to populate
+    # context.patient_id automatically.
+    "pyjwt>=2.8.0",
 ]
 
 [project.optional-dependencies]
+memory = [
+    # Apache-2.0, https://github.com/mem0ai/mem0
+    # Backs the optional `memory_*` tools (cross-session clinical memory).
+    # Skip this group if you don't need persistent memory.
+    "mem0ai>=0.1.50",
+    # mem0's default vector store. mem0ai marks it optional; we pin it
+    # because our `MEM0_VECTOR_STORE` defaults to chroma.
+    "chromadb>=0.5.0",
+]
 dev = [
     "ruff>=0.6.0",
     "pytest>=8.0.0",
