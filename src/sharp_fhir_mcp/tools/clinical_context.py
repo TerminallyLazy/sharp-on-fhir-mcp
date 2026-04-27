@@ -11,7 +11,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 from sharp_fhir_mcp.clients.fhir_client import FHIRError
 from sharp_fhir_mcp.context import fhir_client_for_current_context
@@ -34,7 +34,7 @@ from sharp_fhir_mcp.tools._helpers import (
 def register_clinical_context_tools(mcp: FastMCP) -> None:
     """Register the comprehensive clinical context tool."""
 
-    @mcp.tool()
+    @mcp.tool
     async def clinical_get_context(
         patient_id: str | None = None,
         lab_lookback_days: int = 90,

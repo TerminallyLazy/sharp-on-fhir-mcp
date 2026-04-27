@@ -6,7 +6,7 @@ from the SHARP context headers (``X-FHIR-Server-URL`` / ``X-FHIR-Access-Token``)
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 from sharp_fhir_mcp.clients.fhir_client import FHIRError
 from sharp_fhir_mcp.context import fhir_client_for_current_context
@@ -27,7 +27,7 @@ from sharp_fhir_mcp.tools._helpers import (
 def register_fhir_tools(mcp: FastMCP) -> None:
     """Register generic FHIR R4 tools with the FastMCP instance."""
 
-    @mcp.tool()
+    @mcp.tool
     async def fhir_get_capability_statement() -> dict:
         """Return the FHIR server's ``CapabilityStatement`` (``GET /metadata``).
 
@@ -66,7 +66,7 @@ def register_fhir_tools(mcp: FastMCP) -> None:
             "total_resource_types": len(resources),
         }
 
-    @mcp.tool()
+    @mcp.tool
     async def fhir_get_patient(patient_id: str | None = None) -> dict:
         """Read a single FHIR ``Patient`` resource and return a compact summary.
 
@@ -88,7 +88,7 @@ def register_fhir_tools(mcp: FastMCP) -> None:
         summary = patient_summary(patient)
         return {**summary, "raw": patient}
 
-    @mcp.tool()
+    @mcp.tool
     async def fhir_search(
         resource_type: FHIRResourceType,
         patient_id: str | None = None,
@@ -157,7 +157,7 @@ def register_fhir_tools(mcp: FastMCP) -> None:
             ],
         }
 
-    @mcp.tool()
+    @mcp.tool
     async def fhir_read(resource_type: FHIRResourceType, resource_id: str) -> dict:
         """Read a single FHIR resource by ``resourceType`` and ``id``.
 
@@ -173,7 +173,7 @@ def register_fhir_tools(mcp: FastMCP) -> None:
             return e.to_tool_response()
         return resource
 
-    @mcp.tool()
+    @mcp.tool
     async def fhir_patient_everything(
         patient_id: str | None = None,
         start: str | None = None,

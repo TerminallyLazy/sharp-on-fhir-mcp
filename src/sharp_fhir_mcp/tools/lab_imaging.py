@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 from sharp_fhir_mcp.clients.fhir_client import FHIRError
 from sharp_fhir_mcp.context import fhir_client_for_current_context
@@ -29,7 +29,7 @@ def register_lab_imaging_tools(mcp: FastMCP) -> None:
     # Lab results
     # ====
 
-    @mcp.tool()
+    @mcp.tool
     async def lab_get_results(
         patient_id: str | None = None,
         code: str | None = None,
@@ -79,7 +79,7 @@ def register_lab_imaging_tools(mcp: FastMCP) -> None:
     # Vital signs
     # ====
 
-    @mcp.tool()
+    @mcp.tool
     async def lab_get_vital_signs(
         patient_id: str | None = None,
         date: str | None = None,
@@ -126,7 +126,7 @@ def register_lab_imaging_tools(mcp: FastMCP) -> None:
     # Diagnostic reports
     # ====
 
-    @mcp.tool()
+    @mcp.tool
     async def lab_get_diagnostic_reports(
         patient_id: str | None = None,
         category: str | None = None,
@@ -168,7 +168,7 @@ def register_lab_imaging_tools(mcp: FastMCP) -> None:
     # Imaging / documents
     # ====
 
-    @mcp.tool()
+    @mcp.tool
     async def imaging_get_documents(
         patient_id: str | None = None,
         category: str | None = None,

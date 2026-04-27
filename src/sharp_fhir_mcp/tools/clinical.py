@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 from sharp_fhir_mcp.clients.fhir_client import FHIRError
 from sharp_fhir_mcp.context import fhir_client_for_current_context
@@ -40,7 +40,7 @@ def register_clinical_tools(mcp: FastMCP) -> None:
     # Patient
     # ====
 
-    @mcp.tool()
+    @mcp.tool
     async def clinical_search_patients(
         name: str | None = None,
         family: str | None = None,
@@ -93,7 +93,7 @@ def register_clinical_tools(mcp: FastMCP) -> None:
             "next_link": bundle_next_link(bundle),
         }
 
-    @mcp.tool()
+    @mcp.tool
     async def clinical_get_patient_summary(patient_id: str | None = None) -> dict:
         """Return a summary of a patient — demographics + recent encounters & appointments.
 
@@ -132,7 +132,7 @@ def register_clinical_tools(mcp: FastMCP) -> None:
     # Appointments / Encounters
     # ====
 
-    @mcp.tool()
+    @mcp.tool
     async def clinical_get_appointments(
         patient_id: str | None = None,
         date: str | None = None,
@@ -173,7 +173,7 @@ def register_clinical_tools(mcp: FastMCP) -> None:
             "has_more": bundle_next_link(bundle) is not None,
         }
 
-    @mcp.tool()
+    @mcp.tool
     async def clinical_get_encounters(
         patient_id: str | None = None,
         date: str | None = None,
@@ -216,7 +216,7 @@ def register_clinical_tools(mcp: FastMCP) -> None:
     # Conditions / Problems
     # ====
 
-    @mcp.tool()
+    @mcp.tool
     async def clinical_get_problems(
         patient_id: str | None = None,
         active_only: bool = True,
@@ -255,7 +255,7 @@ def register_clinical_tools(mcp: FastMCP) -> None:
     # Medications
     # ====
 
-    @mcp.tool()
+    @mcp.tool
     async def clinical_get_medications(
         patient_id: str | None = None,
         status: str | None = "active",
@@ -296,7 +296,7 @@ def register_clinical_tools(mcp: FastMCP) -> None:
     # Allergies
     # ====
 
-    @mcp.tool()
+    @mcp.tool
     async def clinical_get_allergies(
         patient_id: str | None = None,
         count: int = 50,
@@ -329,7 +329,7 @@ def register_clinical_tools(mcp: FastMCP) -> None:
     # Immunizations
     # ====
 
-    @mcp.tool()
+    @mcp.tool
     async def clinical_get_immunizations(
         patient_id: str | None = None,
         count: int = 50,
@@ -362,7 +362,7 @@ def register_clinical_tools(mcp: FastMCP) -> None:
     # Consolidated health record
     # ====
 
-    @mcp.tool()
+    @mcp.tool
     async def clinical_get_health_record(patient_id: str | None = None) -> dict:
         """One-shot consolidated patient health record.
 

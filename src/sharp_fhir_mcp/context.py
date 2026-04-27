@@ -12,7 +12,9 @@ Headers:
 
 This module wires those headers into a :class:`contextvars.ContextVar` so that
 asynchronous MCP tool implementations can resolve them on a per-invocation
-basis without any global state.
+basis without any global state. The middleware is implemented as a FastMCP
+middleware (fastmcp 2.x), which has access to the underlying HTTP headers via
+``fastmcp.server.dependencies.get_http_headers()``.
 """
 
 from __future__ import annotations
@@ -21,12 +23,11 @@ import os
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
-from starlette.types import ASGIApp
+from fastmcp.exceptions import ToolError
+from fastmcp.server.dependencies import get_http_headers
+from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 # Header names per SHARP §3.2
 HEADER_FHIR_SERVER_URL = "X-FHIR-Server-URL"
@@ -50,11 +51,9 @@ class SharpContext:
 
     @property
     def has_fhir(self) -> bool:
-        """Whether this context can talk to a FHIR server."""
         return bool(self.server_url and self.access_token)
 
     def require_fhir(self) -> "SharpContext":
-        """Return self if FHIR context is present, else raise."""
         if not self.has_fhir:
             raise FHIRContextMissingError(
                 "FHIR context required. Send the X-FHIR-Server-URL and "
@@ -63,7 +62,6 @@ class SharpContext:
         return self
 
     def require_patient(self) -> str:
-        """Return X-Patient-ID, raising if not present."""
         if not self.patient_id:
             raise FHIRContextMissingError(
                 "Patient context required. Send the X-Patient-ID header or "
@@ -86,16 +84,22 @@ _current_context: ContextVar[SharpContext | None] = ContextVar(
 )
 
 
-def _build_context_from_request(request: Request) -> SharpContext:
-    """Extract SHARP headers from a Starlette request, with env fallbacks."""
-    headers = request.headers
-    server_url = headers.get(HEADER_FHIR_SERVER_URL) or os.getenv(ENV_FHIR_SERVER_URL)
-    access_token = headers.get(HEADER_FHIR_ACCESS_TOKEN) or os.getenv(
+def _normalise_headers(raw: dict[str, str] | None) -> dict[str, str]:
+    """Return a case-insensitive lookup dict (lowercased keys)."""
+    if not raw:
+        return {}
+    return {k.lower(): v for k, v in raw.items()}
+
+
+def _build_context_from_headers(headers: dict[str, str]) -> SharpContext:
+    server_url = headers.get(HEADER_FHIR_SERVER_URL.lower()) or os.getenv(
+        ENV_FHIR_SERVER_URL
+    )
+    access_token = headers.get(HEADER_FHIR_ACCESS_TOKEN.lower()) or os.getenv(
         ENV_FHIR_ACCESS_TOKEN
     )
-    patient_id = headers.get(HEADER_PATIENT_ID) or os.getenv(ENV_PATIENT_ID)
+    patient_id = headers.get(HEADER_PATIENT_ID.lower()) or os.getenv(ENV_PATIENT_ID)
 
-    # Strip "Bearer " prefix if accidentally included by the agent.
     if access_token and access_token.lower().startswith("bearer "):
         access_token = access_token[7:].strip()
 
@@ -109,13 +113,26 @@ def _build_context_from_request(request: Request) -> SharpContext:
 def get_current_context() -> SharpContext:
     """Return the SHARP context for the current request.
 
-    If no middleware ran (e.g., direct in-process call), an env-fallback
-    context is returned. This makes tools safely runnable in tests.
+    Resolution order:
+        1. ContextVar set by SharpContextMiddleware.
+        2. Live-read of HTTP headers via fastmcp's request scope (fallback for
+           tools called outside a middleware-wrapped flow).
+        3. Environment variables (handy for tests / stdio dev).
     """
     ctx = _current_context.get()
     if ctx is not None:
         return ctx
-    # Fall back to environment variables (handy for tests / local dev)
+
+    # Try to read headers directly from the active fastmcp request scope.
+    try:
+        headers = _normalise_headers(get_http_headers() or {})
+    except Exception:  # noqa: BLE001 — outside a request scope
+        headers = {}
+
+    if headers:
+        return _build_context_from_headers(headers)
+
+    # Pure env-var fallback (tests / stdio).
     server_url = os.getenv(ENV_FHIR_SERVER_URL)
     return SharpContext(
         server_url=server_url.rstrip("/") if server_url else None,
@@ -125,17 +142,12 @@ def get_current_context() -> SharpContext:
 
 
 def require_fhir_context() -> SharpContext:
-    """Return current context, raising if FHIR headers are missing."""
     return get_current_context().require_fhir()
 
 
 @asynccontextmanager
-async def fhir_client_for_current_context() -> AsyncIterator["FHIRClient"]:
-    """Yield a configured :class:`FHIRClient` for the current request.
-
-    The client is closed automatically when the context manager exits.
-    """
-    # Imported here to avoid a circular import.
+async def fhir_client_for_current_context() -> AsyncIterator[Any]:
+    """Yield a configured :class:`FHIRClient` for the current request."""
     from sharp_fhir_mcp.clients.fhir_client import FHIRClient
 
     ctx = require_fhir_context()
@@ -147,84 +159,49 @@ async def fhir_client_for_current_context() -> AsyncIterator["FHIRClient"]:
 
 
 # --
-# Starlette middleware
+# FastMCP middleware
 # --
 
 
-class SharpContextMiddleware(BaseHTTPMiddleware):
-    """Reads SHARP headers off every HTTP request and stores them in a ContextVar.
+class SharpContextMiddleware(Middleware):
+    """Read SHARP headers off every MCP request and stash them in a ContextVar.
 
-    By default this is permissive — it does **not** enforce 403 responses.
-    Tools themselves return structured ``fhir_context_required`` errors when
-    they need context that wasn't supplied. To enable strict enforcement
-    (returns ``403 Forbidden`` to the agent for any non-initialize call that
-    lacks FHIR context), pass ``strict=True``.
+    By default the middleware is *permissive*: it never rejects a request,
+    and tools themselves return structured ``fhir_context_required`` errors
+    when headers are missing. Pass ``strict=True`` to make any ``tools/call``
+    without FHIR headers raise a :class:`fastmcp.exceptions.ToolError`
+    (handshake calls — ``initialize``, ``tools/list``, ``ping`` — are always
+    allowed through).
     """
 
-    def __init__(self, app: ASGIApp, *, strict: bool = False) -> None:
-        super().__init__(app)
+    def __init__(self, *, strict: bool = False) -> None:
         self.strict = strict
 
-    async def dispatch(self, request: Request, call_next) -> Response:  # type: ignore[override]
-        ctx = _build_context_from_request(request)
-
-        if self.strict and request.method == "POST" and not ctx.has_fhir:
-            # Allow the body through only if we can determine it is an
-            # ``initialize`` or ``tools/list`` call. Otherwise reject early.
-            try:
-                body = await request.body()
-                # Wrap to make body re-readable downstream.
-                async def _receive() -> dict:  # type: ignore[no-redef]
-                    return {"type": "http.request", "body": body, "more_body": False}
-
-                request._receive = _receive  # type: ignore[attr-defined]
-                method = _peek_jsonrpc_method(body)
-            except Exception:
-                method = None
-
-            if method not in {"initialize", "notifications/initialized", "tools/list", "ping"}:
-                return JSONResponse(
-                    status_code=403,
-                    content={
-                        "error": "fhir_context_required",
-                        "message": (
-                            "This MCP server advertises "
-                            "`capabilities.experimental.fhir_context_required = true`. "
-                            "Include X-FHIR-Server-URL and X-FHIR-Access-Token headers."
-                        ),
-                        "required_headers": [
-                            HEADER_FHIR_SERVER_URL,
-                            HEADER_FHIR_ACCESS_TOKEN,
-                        ],
-                    },
-                )
+    async def on_message(
+        self, context: MiddlewareContext, call_next
+    ):  # type: ignore[override]
+        headers = _normalise_headers(get_http_headers() or {})
+        ctx = _build_context_from_headers(headers)
 
         token = _current_context.set(ctx)
         try:
-            response = await call_next(request)
+            return await call_next(context)
         finally:
             _current_context.reset(token)
-        return response
 
-
-def _peek_jsonrpc_method(body: bytes) -> str | None:
-    """Best-effort sniff of the JSON-RPC method without consuming the body."""
-    if not body:
-        return None
-    try:
-        import json
-
-        payload = json.loads(body)
-    except Exception:
-        return None
-    if isinstance(payload, list):
-        # Batch — return first method, only used for routing decisions.
-        if payload:
-            return payload[0].get("method") if isinstance(payload[0], dict) else None
-        return None
-    if isinstance(payload, dict):
-        return payload.get("method")
-    return None
+    async def on_call_tool(
+        self, context: MiddlewareContext, call_next
+    ):  # type: ignore[override]
+        if self.strict:
+            ctx = _current_context.get() or _build_context_from_headers(
+                _normalise_headers(get_http_headers() or {})
+            )
+            if not ctx.has_fhir:
+                raise ToolError(
+                    "fhir_context_required: send X-FHIR-Server-URL and "
+                    "X-FHIR-Access-Token headers per SHARP-on-MCP §3.2."
+                )
+        return await call_next(context)
 
 
 __all__ = [

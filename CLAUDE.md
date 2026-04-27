@@ -11,21 +11,21 @@ has a paragraph and every important design decision has a one-line rationale.
 ```
 src/sharp_fhir_mcp/
 ├── __init__.py
-├── server.py                  # FastMCP entry point + SHARP capability injection
-├── context.py                 # SharpContext, ContextVar plumbing, Starlette middleware
+├── server.py                  # FastMCP 2.x entry point + SHARP capability injection
+├── context.py                 # SharpContext + FastMCP middleware (HTTP-header → ContextVar)
 ├── fhir_utils.py              # Pure functions normalising FHIR R4 → compact dicts
 ├── models/
 │   └── types.py               # Literals/enums/typed dicts shared across tools
 ├── clients/
 │   ├── fhir_client.py         # Vendor-neutral async FHIR R4 client
-│   └── simplemem_client.py    # Optional clinical memory client
+│   └── omnimem_client.py      # Optional multimodal-memory REST client (OmniSimpleMem)
 ├── tools/
 │   ├── _helpers.py            # Functional helpers shared by tool modules
 │   ├── fhir.py                # Generic FHIR search/read tools
 │   ├── clinical.py            # Patient / Encounter / Appointment / Allergy / …
 │   ├── lab_imaging.py         # Observation / DiagnosticReport / DocumentReference
 │   ├── clinical_context.py    # Aggregated visit context with derived alerts
-│   ├── memory.py              # SimpleMem-backed cross-session memory (optional)
+│   ├── memory.py              # OmniSimpleMem-backed multimodal memory (optional)
 │   └── visualization.py       # MCP-UI Chart.js dashboards
 └── ui/
     ├── clinical_charts.py     # Chart.js HTML builders
@@ -38,14 +38,21 @@ src/sharp_fhir_mcp/
 
 ### Streamable HTTP transport (SHARP §"Scope")
 
-`server.py` defaults to streamable-http via `FastMCP.streamable_http_app()`.
-stdio is supported behind an explicit `--transport stdio` flag with a
-deprecation warning, since SHARP-on-MCP §"Scope" excludes stdio from the spec.
+`server.py` builds on **standalone FastMCP 2.x** (gofastmcp.com) — *not*
+Anthropic's lower-level `mcp.server.fastmcp` SDK. FastMCP 2.x has proper
+async-host integration (its CLI calls `run_async()` rather than
+`asyncio.run()`), which is what hosted deployments expect.
+
+The default transport is HTTP (Streamable). stdio remains available behind
+`--transport stdio` for legacy local dev, but per SHARP §"Scope" it is not in
+scope of the spec.
 
 ### Header-based context (SHARP §3.2)
 
-`SharpContextMiddleware` (in `context.py`) reads three headers off every
-incoming request and stores them in a `ContextVar[SharpContext]`:
+`SharpContextMiddleware` (in `context.py`) is a **FastMCP middleware** (not
+a Starlette HTTP middleware) — it reads HTTP headers off the active request
+via `fastmcp.server.dependencies.get_http_headers()` and stores the resolved
+context in a `ContextVar[SharpContext]`:
 
 | Header                | Stored as            |
 | --------------------- | -------------------- |
@@ -70,15 +77,18 @@ stdio run), the helper falls back to `FHIR_SERVER_URL` /
   context return a structured `{"error": "fhir_context_required", ...}`
   payload describing which headers were missing. This keeps tools that don't
   need context (e.g. introspection) usable without auth.
-* **Strict:** when launched with `--strict-context`, the middleware returns
-  HTTP 403 with the same structured payload for any non-handshake request
-  (`initialize`, `tools/list`, `ping`) that lacks FHIR headers. This is the
-  recommended setting for production deployments.
+* **Strict:** when `SHARP_STRICT_CONTEXT=1` is set, the middleware's
+  `on_call_tool` hook raises a `fastmcp.exceptions.ToolError` for any
+  `tools/call` that arrives without FHIR context. Handshake calls
+  (`initialize`, `tools/list`, `ping`) always pass through. Recommended for
+  production.
 
 ### `fhir_context_required` capability
 
 `server._patch_capabilities()` monkey-patches the inner low-level
-`Server.create_initialization_options` so every initialise response includes:
+`create_initialization_options` (resolved defensively across FastMCP attribute
+names — `_mcp_server` / `_low_level_server` / `server`) so every initialise
+response includes:
 
 ```json
 {
@@ -107,7 +117,7 @@ def resolve_patient_id(explicit: str | None) -> str | None: ...
 Tools use them like:
 
 ```python
-@mcp.tool()
+@mcp.tool
 async def clinical_get_problems(patient_id: str | None = None, ...) -> dict:
     if (err := check_fhir_context(require_patient=True, patient_id=patient_id)) is not None:
         return err
@@ -178,14 +188,47 @@ no bundling required. `ClinicalDisplayBuilder` builds the surrounding cards.
 
 ---
 
-## Memory (optional)
+## Memory (optional, multimodal)
 
-`SimpleMemClient.from_env()` returns `None` when the SimpleMem environment
-variables are missing, and `register_memory_tools(mcp, None)` is a no-op.
-This lets the rest of the server run without any memory backend.
+`OmniMemClient.from_env()` returns `None` when `OMNIMEM_API_URL` is unset,
+and `register_memory_tools(mcp, None)` is a no-op. This lets the rest of
+the server run without any memory backend.
 
-When configured, the memory tools tag every stored item with the FHIR
-patient resource id (a string), enabling fast filtering on retrieval.
+The client speaks the [OmniSimpleMem](https://github.com/aiming-lab/SimpleMem/tree/main/OmniSimpleMem)
+REST API:
+
+| Endpoint                   | Used by                                 |
+| -------------------------- | --------------------------------------- |
+| `POST /memory/text`        | `memory_store_encounter/alert/note`     |
+| `POST /memory/image`       | `memory_store_image`                    |
+| `POST /memory/audio`       | `memory_store_audio`                    |
+| `POST /memory/video`       | `memory_store_video`                    |
+| `POST /query`              | `memory_search_history`, `memory_get_patient_history` |
+| `POST /answer`             | `memory_answer_question` (RAG)          |
+| `POST /expand`             | `memory_expand` (preview → evidence)    |
+| `GET  /stats`              | `memory_stats`                          |
+
+Every stored item is tagged with `patient_id:<FHIR id>` plus a `type:` tag
+(`encounter` / `alert` / `note` / `image` / `audio` / `video`). Search calls
+re-inject the patient tag into the query string so OmniSimpleMem's BM25
+sparse retriever scopes results to one patient.
+
+**Multimodal ingestion path:** the agent host writes a media file into the
+shared volume (`./shared` on the host → `/shared` in both containers), then
+calls `memory_store_image` (or `_audio`/`_video`) with that path. The
+OmniMem client streams the file as multipart form data; OmniSimpleMem then
+runs CLIP scene-change detection (visual) or VAD silence-filtering (audio)
+to drop redundant content before storage.
+
+**Embeddings:** OmniSimpleMem defaults to local sentence-transformers
+(`all-MiniLM-L6-v2`, 384-dim). LLM steps (summary / answer / caption) use
+an OpenAI-compatible endpoint — set `OPENAI_API_BASE` to point at OpenRouter,
+Ollama OpenAI-mode, vLLM, LM Studio, etc.
+
+**Upstream caveat:** OmniSimpleMem's `omni_memory/core/config.py` was missing
+on `main` at the time of writing. `docker/omnimem/Dockerfile` checks for the
+file and copies in `docker/omnimem/config_shim.py` if absent. Remove the
+shim once upstream ships the real config module.
 
 ---
 
@@ -193,7 +236,8 @@ patient resource id (a string), enabling fast filtering on retrieval.
 
 1. Pick the right module under `tools/`. New domains (e.g. care plans) get a
    new `tools/care_plans.py` file with `register_care_plan_tools(mcp)`.
-2. Add an `async def your_tool(...) -> dict` decorated with `@mcp.tool()`.
+2. Add an `async def your_tool(...) -> dict` decorated with `@mcp.tool`
+   (no parens — fastmcp 2.x decorator form).
 3. Inside the body:
    * Call `check_fhir_context(...)` first.
    * Resolve patient id with `resolve_patient_id(...)`.

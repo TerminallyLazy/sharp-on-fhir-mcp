@@ -11,7 +11,7 @@ import asyncio
 import time
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from mcp_ui import CreateUIResourceOptions, RawHtmlContent, create_ui_resource
 
 from sharp_fhir_mcp.clients.fhir_client import FHIRError
@@ -48,7 +48,7 @@ def register_visualization_tools(mcp: FastMCP) -> None:
     # Single-test lab trend chart
     # ====
 
-    @mcp.tool()
+    @mcp.tool
     async def visualize_lab_trend(
         loinc_or_test: str,
         patient_id: str | None = None,
@@ -125,7 +125,7 @@ def register_visualization_tools(mcp: FastMCP) -> None:
     # Vitals dashboard
     # ====
 
-    @mcp.tool()
+    @mcp.tool
     async def visualize_vitals(
         patient_id: str | None = None,
         date_from: str | None = None,
@@ -166,7 +166,7 @@ def register_visualization_tools(mcp: FastMCP) -> None:
     # Full patient dashboard (HTML + charts)
     # ====
 
-    @mcp.tool()
+    @mcp.tool
     async def visualize_patient_dashboard(
         patient_id: str | None = None,
         include_charts: bool = True,
